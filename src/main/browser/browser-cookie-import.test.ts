@@ -11,8 +11,13 @@ vi.mock('electron', () => ({
   session: { fromPartition: sessionFromPartitionMock }
 }))
 
-import { importCookiesFromFile, detectInstalledBrowsers } from './browser-cookie-import'
-import { writeFileSync, mkdtempSync, rmSync } from 'node:fs'
+import {
+  importCookiesFromFile,
+  detectInstalledBrowsers,
+  resolveCookiesPath,
+  resolveDestinationCookiesPath
+} from './browser-cookie-import'
+import { writeFileSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -206,6 +211,67 @@ describe('importCookiesFromFile', () => {
     }
     expect(result.summary.importedCookies).toBe(1)
     expect(result.summary.skippedCookies).toBe(1)
+  })
+})
+
+describe('resolveCookiesPath', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'orca-cookies-path-test-'))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('returns null when neither Network/Cookies nor legacy Cookies exists', () => {
+    expect(resolveCookiesPath(dir)).toBeNull()
+  })
+
+  it('returns the modern Network/Cookies path when present', () => {
+    mkdirSync(join(dir, 'Network'), { recursive: true })
+    writeFileSync(join(dir, 'Network', 'Cookies'), '')
+    expect(resolveCookiesPath(dir)).toBe(join(dir, 'Network', 'Cookies'))
+  })
+
+  it('falls back to legacy <profile>/Cookies when Network/Cookies is absent', () => {
+    writeFileSync(join(dir, 'Cookies'), '')
+    expect(resolveCookiesPath(dir)).toBe(join(dir, 'Cookies'))
+  })
+
+  it('prefers Network/Cookies when both exist', () => {
+    mkdirSync(join(dir, 'Network'), { recursive: true })
+    writeFileSync(join(dir, 'Network', 'Cookies'), '')
+    writeFileSync(join(dir, 'Cookies'), '')
+    expect(resolveCookiesPath(dir)).toBe(join(dir, 'Network', 'Cookies'))
+  })
+})
+
+describe('resolveDestinationCookiesPath', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'orca-dest-cookies-path-test-'))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('returns the modern Network/Cookies path for a fresh partition (where Electron will create the file)', () => {
+    expect(resolveDestinationCookiesPath(dir)).toBe(join(dir, 'Network', 'Cookies'))
+  })
+
+  it('returns the existing Network/Cookies path when present', () => {
+    mkdirSync(join(dir, 'Network'), { recursive: true })
+    writeFileSync(join(dir, 'Network', 'Cookies'), '')
+    expect(resolveDestinationCookiesPath(dir)).toBe(join(dir, 'Network', 'Cookies'))
+  })
+
+  it('returns the legacy path when only the legacy DB exists', () => {
+    writeFileSync(join(dir, 'Cookies'), '')
+    expect(resolveDestinationCookiesPath(dir)).toBe(join(dir, 'Cookies'))
   })
 })
 
