@@ -7,6 +7,7 @@ import {
   appendFileSync,
   copyFileSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -144,7 +145,7 @@ function browserRootPath(def: ChromiumBrowserDef): string | null {
 
 // Why: Chromium 96+ moved the cookies DB from <Profile>/Cookies to
 // <Profile>/Network/Cookies. Try the newer path first, fall back to legacy.
-function resolveCookiesPath(profileDir: string): string | null {
+export function resolveCookiesPath(profileDir: string): string | null {
   const networkPath = join(profileDir, 'Network', 'Cookies')
   if (existsSync(networkPath)) {
     return networkPath
@@ -154,6 +155,30 @@ function resolveCookiesPath(profileDir: string): string | null {
     return legacyPath
   }
   return null
+}
+
+// Why: Electron's partition cookies DB lands at <partition>/Network/Cookies on
+// modern Chromium. Older builds used the legacy <partition>/Cookies. Mirror the
+// source-side lookup order, and when neither exists yet return the modern path
+// because that's where the first flush will create it. Exported for tests.
+export function resolveDestinationCookiesPath(partitionDir: string): string {
+  return resolveCookiesPath(partitionDir) ?? join(partitionDir, 'Network', 'Cookies')
+}
+
+// Why: on Windows, flushStore() can resolve a few ms before the SQLite file
+// actually lands on disk. Poll briefly so a transient race doesn't surface as
+// "cookie database not found".
+async function waitForCookiesFile(partitionDir: string, maxMs = 2000): Promise<string | null> {
+  const stepMs = 100
+  const deadline = Date.now() + maxMs
+  while (Date.now() < deadline) {
+    const found = resolveCookiesPath(partitionDir)
+    if (found) {
+      return found
+    }
+    await new Promise((resolve) => setTimeout(resolve, stepMs))
+  }
+  return resolveCookiesPath(partitionDir)
 }
 
 // Why: Chrome's Local State JSON contains profile.info_cache which maps profile
@@ -583,9 +608,9 @@ async function importValidatedCookies(
 // compromised renderer cannot turn cookie import into arbitrary file reads.
 export async function pickCookieFile(parentWindow: BrowserWindow | null): Promise<string | null> {
   const opts = {
-    title: 'Import Cookies',
+    title: 'Import cookies from JSON file (raw Chrome SQLite is not supported)',
     filters: [
-      { name: 'Cookie Files', extensions: ['json'] },
+      { name: 'Cookie JSON', extensions: ['json'] },
       { name: 'All Files', extensions: ['*'] }
     ],
     properties: ['openFile' as const]
@@ -615,11 +640,20 @@ export async function importCookiesFromFile(
   try {
     parsed = JSON.parse(rawContent)
   } catch {
-    return { ok: false, reason: 'File is not valid JSON.' }
+    return {
+      ok: false,
+      reason:
+        'File is not valid JSON. The raw Chrome "Cookies" SQLite file is not supported — ' +
+        'export to JSON first using a Chrome extension like Cookie-Editor or EditThisCookie.'
+    }
   }
 
   if (!Array.isArray(parsed)) {
-    return { ok: false, reason: 'Expected a JSON array of cookie objects.' }
+    return {
+      ok: false,
+      reason:
+        'Expected a JSON array of cookie objects (e.g. exported from Cookie-Editor / EditThisCookie).'
+    }
   }
 
   if (parsed.length === 0) {
@@ -1291,7 +1325,11 @@ export async function importCookiesFromBrowser(
     rmSync(tmpDir, { recursive: true, force: true })
     return {
       ok: false,
-      reason: `Could not copy ${browser.label} cookies database. Try closing ${browser.label} first.`
+      reason:
+        `Could not copy ${browser.label} cookies database. ` +
+        `Fully quit ${browser.label} first — on Windows, check Task Manager → Details for any lingering ` +
+        `${browser.label.toLowerCase()}.exe processes, and disable "Continue running background apps when ` +
+        `${browser.label} is closed" under chrome://settings/system before trying again.`
     }
   }
 
@@ -1321,8 +1359,21 @@ export async function importCookiesFromBrowser(
   const targetSession = session.fromPartition(targetPartition)
   await targetSession.cookies.flushStore()
 
-  const partitionName = targetPartition.replace('persist:', '')
-  const liveCookiesPath = join(app.getPath('userData'), 'Partitions', partitionName, 'Cookies')
+  const partitionName = targetPartition.startsWith('persist:')
+    ? targetPartition.slice('persist:'.length)
+    : targetPartition
+  const partitionDir = join(app.getPath('userData'), 'Partitions', partitionName)
+  // Why: Electron's CookieMonster silently no-ops the flush if the parent
+  // directory chain doesn't exist (fresh partition that has never been used).
+  // Pre-creating Network/ removes one possible failure mode for the dance below.
+  try {
+    mkdirSync(join(partitionDir, 'Network'), { recursive: true })
+  } catch (err) {
+    diag(`  mkdir Network/ failed (non-fatal): ${err}`)
+  }
+
+  let liveCookiesPath = resolveDestinationCookiesPath(partitionDir)
+  diag(`  partitionDir=${partitionDir} initial liveCookiesPath=${liveCookiesPath} exists=${existsSync(liveCookiesPath)}`)
 
   // Why: Electron only creates the partition's Cookies SQLite file after the
   // session has actually stored a cookie. For newly created profiles that have
@@ -1333,14 +1384,28 @@ export async function importCookiesFromBrowser(
       await targetSession.cookies.set({ url: 'https://localhost', name: '__init', value: '1' })
       await targetSession.cookies.remove('https://localhost', '__init')
       await targetSession.cookies.flushStore()
-    } catch {
-      // ignore — the set/remove may fail but flushStore should still create the file
+      diag('  init dance: set+remove+flush completed')
+    } catch (err) {
+      diag(`  init dance threw (continuing): ${err}`)
     }
+    // Why: on Windows, the SQLite file lands on disk a few ms after flushStore
+    // resolves. Poll briefly to absorb the race before declaring failure.
+    const resolved = await waitForCookiesFile(partitionDir)
+    if (resolved) {
+      liveCookiesPath = resolved
+    }
+    diag(`  post-dance liveCookiesPath=${liveCookiesPath} exists=${existsSync(liveCookiesPath)}`)
   }
 
   if (!existsSync(liveCookiesPath)) {
     rmSync(tmpDir, { recursive: true, force: true })
-    return { ok: false, reason: 'Target cookie database not found. Open a browser tab first.' }
+    return {
+      ok: false,
+      reason:
+        "Orca couldn't initialize its own cookie store for this browser profile. " +
+        "Open a tab in Orca's built-in browser for this profile, navigate to any page (e.g. example.com), " +
+        'then try the import again.'
+    }
   }
 
   const stagingCookiesPath = join(app.getPath('userData'), 'Cookies-staged')
